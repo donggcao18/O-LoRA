@@ -79,13 +79,17 @@ class UIEConfig(datasets.BuilderConfig):
     ):
         super().__init__(*args, **kwargs)
         self.data_dir = data_dir
-        self.num_examples = num_examples
-        self.over_sampling = over_sampling
-        self.instructions = self._parse_instruction(instruction_file)
-        self.task_configs = self._parse_task_config(task_config_dir)
+        self.instruction_file = instruction_file
         self.instruction_strategy = instruction_strategy
+        self.task_config_dir = task_config_dir
+        self.num_examples = num_examples
         self.max_num_instances_per_task = max_num_instances_per_task
         self.max_num_instances_per_eval_task = max_num_instances_per_eval_task
+        self.over_sampling = over_sampling
+
+        # Parsed artifacts (used by the builder implementation)
+        self.instructions = self._parse_instruction(instruction_file)
+        self.task_configs = self._parse_task_config(task_config_dir)
 
 
     def _parse_instruction(self, instruction_file):
@@ -196,8 +200,23 @@ class UIEInstructions(datasets.GeneratorBasedBuilder):
 
     def _split_generators(self, dl_manager):
         """Returns SplitGenerators."""
-        if self.config.data_dir is None or self.config.task_configs is None:
-            logger.error("Please provide right input: data_dir or task_config_dir!")
+        # Validate config early to avoid cryptic NoneType errors.
+        if not self.config.data_dir or not os.path.exists(self.config.data_dir):
+            raise ValueError(
+                f"Invalid `data_dir`: {self.config.data_dir!r}. "
+                "Pass --data_dir pointing to the dataset root (e.g. CL_Benchmark)."
+            )
+        if not getattr(self.config, "task_config_dir", None) or not os.path.exists(self.config.task_config_dir):
+            raise ValueError(
+                f"Invalid `task_config_dir`: {getattr(self.config, 'task_config_dir', None)!r}. "
+                "Pass --task_config_dir pointing to a folder containing train_tasks.json/dev_tasks.json/test_tasks.json."
+            )
+        if self.config.task_configs is None:
+            raise ValueError(
+                "Failed to load task configs. "
+                f"task_config_dir={self.config.task_config_dir!r}. "
+                f"Expected files: {', '.join(TASK_CONFIG_FILES.values())}"
+            )
 
         # split dir save datasets
         # task config to specify train,dev,test

@@ -4,7 +4,7 @@ import os
 import argparse
 import logging
 
-from rouge import rouge_scorer
+from rouge_score import rouge_scorer
 from transformers import AutoTokenizer
 
 

@@ -21,6 +21,19 @@ Fine-tuning the library models for sequence to sequence.
 import logging
 import os
 import sys
+
+# IMPORTANT:
+# The repo contains a vendored folder `src/peft/` which can shadow the pip package `peft`.
+# Transformers >= 4.28 expects newer `peft` symbols (e.g. PeftMixedModel).
+# We still need the repo's own modules (e.g. uie_collator) to be importable.
+# So: add project root to sys.path, and remove `src/` itself from sys.path.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))          # .../src
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)                      # repo root
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+if _THIS_DIR in sys.path:
+    sys.path.remove(_THIS_DIR)
+
 import json
 import time
 from dataclasses import dataclass, field
@@ -44,14 +57,18 @@ from transformers import (
     set_seed, )
 from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint
-from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig # add
+from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig  # add
 
-from uie_collator import DataCollatorForUIE
-from uie_dataset_lora import gen_cache_path
+from src.uie_collator import DataCollatorForUIE
+from src.uie_dataset_lora import gen_cache_path
 
-from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
-from compute_metrics import compute_metrics, compute_grouped_metrics
-from model.llama import LlamaForCausalLM_with_lossmask
+from src.uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
+from src.compute_metrics import compute_metrics, compute_grouped_metrics
+from src.model.llama import LlamaForCausalLM_with_lossmask
+
+# Optional: code task dataset adapter (single-task per run)
+from src.code_tasks_dataset import build_code_task_dataset
+from transformers import DataCollatorForSeq2Seq
 
 # off wandb
 os.environ['WANDB_DISABLED'] = "True"
@@ -122,10 +139,27 @@ class ModelArguments:
 
 @dataclass
 class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
+    """Arguments pertaining to what data we are going to input our model for training and eval."""
     lang: str = field(default=None, metadata={"help": "Language id for multilingual model."})
+
+    # Dataset mode: 'uie' (repo default) or 'code' (single code task from HF datasets).
+    dataset_mode: str = field(
+        default="uie",
+        metadata={"help": "Dataset mode: 'uie' uses uie_dataset_lora.py; 'code' uses code_tasks_dataset.py"},
+    )
+    code_task: Optional[str] = field(
+        default=None,
+        metadata={"help": "When dataset_mode='code', the task name (e.g., CodeTrans, CONCODE, BFP, CoST, ...)"},
+    )
+    code_k: int = field(
+        default=-1,
+        metadata={"help": "When dataset_mode='code', optional subset size per split; -1 means use full split."},
+    )
+    code_shuffle_seed: int = field(
+        default=0,
+        metadata={"help": "When dataset_mode='code', shuffle seed."},
+    )
+
     data_dir: str = field(
         default=None, metadata={"help": "The directory for saving the UIE train/dev/test splits."}
     )
@@ -291,21 +325,51 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
-    data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
 
-    # Get the UIE dataset
-    raw_datasets = load_dataset(
-        os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
-        data_dir=data_args.data_dir,
-        task_config_dir=data_args.task_config_dir,
-        instruction_file=data_args.instruction_file,
-        instruction_strategy=data_args.instruction_strategy,
-        cache_dir=data_cache_dir,  # for debug, change dataset size, otherwise open it
-        max_num_instances_per_task=data_args.max_num_instances_per_task,
-        max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-        num_examples=data_args.num_examples
-    )
-    raw_datasets.cleanup_cache_files()
+    # Ensure output/cache directories exist (required for FileLock on Windows).
+    os.makedirs(training_args.output_dir, exist_ok=True)
+
+    # Prefer a short, stable cache directory on Windows to avoid deep path/lock issues.
+    # If user doesn't pass `--cache_dir`, fall back to a short path.
+    hf_cache_dir = model_args.cache_dir or os.path.join(os.path.splitdrive(training_args.output_dir)[0] + os.sep, "hf_cache")
+    os.makedirs(hf_cache_dir, exist_ok=True)
+
+    # Get datasets
+    if data_args.dataset_mode.lower() == "code":
+        if not data_args.code_task:
+            raise ValueError("--code_task is required when --dataset_mode=code")
+
+        # Delay building tokenized datasets until after tokenizer is loaded.
+        raw_datasets = None
+    else:
+        data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
+        os.makedirs(data_cache_dir, exist_ok=True)
+
+        # Validate dataset inputs early (avoid failing deep inside the dataset script).
+        if not data_args.data_dir or not os.path.exists(data_args.data_dir):
+            raise ValueError(f"Invalid --data_dir: {data_args.data_dir!r}")
+        if not data_args.task_config_dir or not os.path.exists(data_args.task_config_dir):
+            raise ValueError(f"Invalid --task_config_dir: {data_args.task_config_dir!r}")
+        if not data_args.instruction_file or not os.path.exists(data_args.instruction_file):
+            raise ValueError(f"Invalid --instruction_file: {data_args.instruction_file!r}")
+
+        # Get the UIE dataset
+        # NOTE: On Windows, `datasets` cannot use SIGALRM for timeouts. Also, dataset scripts are treated as custom code.
+        raw_datasets = load_dataset(
+            os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
+            name="default",
+            cache_dir=hf_cache_dir,
+            trust_remote_code=True,
+            download_config=datasets.DownloadConfig(use_etag=False, num_proc=1, max_retries=10, disable_tqdm=False),
+            data_dir=data_args.data_dir,
+            instruction_file=data_args.instruction_file,
+            instruction_strategy=data_args.instruction_strategy,
+            task_config_dir=data_args.task_config_dir,
+            num_examples=data_args.num_examples,
+            max_num_instances_per_task=data_args.max_num_instances_per_task,
+            max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
+        )
+        raw_datasets.cleanup_cache_files()
 
     # Load pretrained model and tokenizer
     #
@@ -359,6 +423,19 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
+    # If using code dataset mode, build tokenized datasets now that tokenizer is available.
+    if data_args.dataset_mode.lower() == "code":
+        raw_datasets = build_code_task_dataset(
+            tokenizer=tokenizer,
+            task=data_args.code_task,
+            split_seed=42,
+            shuffle_seed=data_args.code_shuffle_seed,
+            k=data_args.code_k,
+            max_target_length=data_args.max_target_length,
+            max_source_length=data_args.max_source_length,
+            cache_dir=hf_cache_dir,
+        )
+
     if 'llama' in model_args.model_name_or_path.lower():  # add llama
         model_class = LlamaForCausalLM_with_lossmask
         tokenizer.padding_side = 'left'
@@ -406,14 +483,17 @@ def main():
     # fine-tune loranew_A/B (initialized in "update_layer"[lora.py])
     # optional: lora_A/B is trainable but should not move too far from lorapre_A/B
     # (constrained in "training_step"[uie_trainer_lora.py])
-    for name, param in model.named_parameters():
-        if name.find("loranew_") != -1:
-            param.requires_grad = True
-        elif name.find("lora_") != -1:
-            param.requires_grad = False
-        # this module should always be frozen because we change the vocabulary
-        elif name.find("shared") != -1:
-            param.requires_grad = False
+    # NOTE: This custom freezing logic is for the original O-LoRA training scheme (loranew_ only).
+    # For code-mode (generic PEFT LoRA), we keep PEFT's default trainable parameters.
+    if data_args.dataset_mode.lower() != "code":
+        for name, param in model.named_parameters():
+            if name.find("loranew_") != -1:
+                param.requires_grad = True
+            elif name.find("lora_") != -1:
+                param.requires_grad = False
+            # this module should always be frozen because we change the vocabulary
+            elif name.find("shared") != -1:
+                param.requires_grad = False
 
     if (
             hasattr(model.config, "max_position_embeddings")
@@ -457,19 +537,29 @@ def main():
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    data_collator = DataCollatorForUIE(
-        tokenizer,
-        model=model,
-        padding="longest",
-        max_source_length=data_args.max_source_length,
-        max_target_length=data_args.max_target_length,
-        label_pad_token_id=label_pad_token_id,
-        pad_to_multiple_of=8 if training_args.fp16 else None,
-        add_task_name=data_args.add_task_name,
-        add_dataset_name=data_args.add_dataset_name,
-        num_examples=data_args.num_examples,
-        input_record_file=data_args.input_record_file
-    )
+
+    if data_args.dataset_mode.lower() == "code":
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            padding="longest",
+            label_pad_token_id=label_pad_token_id,
+            pad_to_multiple_of=8 if training_args.fp16 else None,
+        )
+    else:
+        data_collator = DataCollatorForUIE(
+            tokenizer,
+            model=model,
+            padding="longest",
+            max_source_length=data_args.max_source_length,
+            max_target_length=data_args.max_target_length,
+            label_pad_token_id=label_pad_token_id,
+            pad_to_multiple_of=8 if training_args.fp16 else None,
+            add_task_name=data_args.add_task_name,
+            add_dataset_name=data_args.add_dataset_name,
+            num_examples=data_args.num_examples,
+            input_record_file=data_args.input_record_file
+        )
     # we don't want to remove unused columns because we will prepare each batch during training,
     # and some of the information will also be used in evaluation.
     training_args.remove_unused_columns = False
@@ -500,9 +590,141 @@ def main():
                     }) + "\n")
         return result
 
+    def compute_code_metrics(dataset, preds, save_prefix=None):
+        import collections
+        import math
+        import re
+        import string
+
+        from smooth_bleu_utils import compute_smooth_bleu
+
+        def normalize_text(s: str) -> str:
+            # Match the user's BLEU normalization
+            def remove_articles(text: str) -> str:
+                return re.sub(r"\b(a|an|the)\b", " ", text)
+
+            def white_space_fix(text: str) -> str:
+                return " ".join(text.split())
+
+            def remove_punc(text: str) -> str:
+                return "".join(ch for ch in text if ch not in set(string.punctuation))
+
+            s = s.lower().replace("<pad>", "").replace("</s>", "")
+            return white_space_fix(remove_articles(remove_punc(s)))
+
+        def _get_ngrams(toks, max_order: int):
+            c = collections.Counter()
+            for o in range(1, max_order + 1):
+                for i in range(0, len(toks) - o + 1):
+                    c[tuple(toks[i: i + o])] += 1
+            return c
+
+        def compute_bleu(refs, hyps, max_order=4, smooth=False):
+            matches = [0] * max_order
+            possibles = [0] * max_order
+            ref_len = 0
+            hyp_len = 0
+            for rlist, hyp in zip(refs, hyps):
+                r_tokens_list = [r.split() for r in rlist]
+                h = hyp.split()
+                ref_len += min(len(r) for r in r_tokens_list) if r_tokens_list else 0
+                hyp_len += len(h)
+                merged = collections.Counter()
+                for r in r_tokens_list:
+                    merged |= _get_ngrams(r, max_order)
+                h_counts = _get_ngrams(h, max_order)
+                overlap = h_counts & merged
+                for ng in overlap:
+                    matches[len(ng) - 1] += overlap[ng]
+                for o in range(1, max_order + 1):
+                    p = len(h) - o + 1
+                    if p > 0:
+                        possibles[o - 1] += p
+            prec = [0] * max_order
+            for i in range(max_order):
+                if smooth:
+                    prec[i] = (matches[i] + 1.0) / (possibles[i] + 1.0)
+                else:
+                    prec[i] = (matches[i] / possibles[i]) if possibles[i] > 0 else 0.0
+            geo = math.exp(sum((1.0 / max_order) * math.log(p) for p in prec)) if min(prec) > 0 else 0.0
+            ratio = float(hyp_len) / max(1, ref_len)
+            bp = 1.0 if ratio > 1.0 else math.exp(1 - 1.0 / max(ratio, 1e-9))
+            return geo * bp
+
+        decoded_preds = skip_instructions(model, preds, tokenizer)
+
+        # For code dataset adapter we store raw label as a plain string in column `labels_text` if present;
+        # fallback to `Instance/label` when evaluating on UIE-style datasets.
+        if "labels_text" in dataset.column_names:
+            references_raw = list(dataset["labels_text"])
+            tasks = list(dataset["task"]) if "task" in dataset.column_names else ["unknown"] * len(references_raw)
+        else:
+            references_raw = [e["Instance"]["label"] for e in dataset]
+            tasks = list(dataset["Task"]) if "Task" in dataset.column_names else ["unknown"] * len(references_raw)
+
+        # Corpus BLEU style expects list of refs per example
+        refs_norm = [[normalize_text(r)] for r in references_raw]
+        hyps_norm = [normalize_text(p) for p in decoded_preds]
+
+        # Split by task: CodeSearchNet + TheVault_Csharp use smooth BLEU; others use classic BLEU.
+        smooth_tasks = {"CodeSearchNet", "TheVault_Csharp"}
+
+        scores_by_task = {}
+        for t in set(tasks):
+            idxs = [i for i, tt in enumerate(tasks) if tt == t]
+            if not idxs:
+                continue
+            t_refs = [refs_norm[i] for i in idxs]
+            t_hyps = [hyps_norm[i] for i in idxs]
+            if t in smooth_tasks:
+                bleu = compute_smooth_bleu(t_refs, t_hyps, n=4, smooth=1, eff_ref_len="shortest",
+                                           preserve_case=False, nonorm=False)
+                scores_by_task[f"smooth_bleu_for_{t}"] = round(100.0 * bleu, 4)
+            else:
+                bleu = compute_bleu(t_refs, t_hyps, max_order=4, smooth=False)
+                scores_by_task[f"bleu_for_{t}"] = round(100.0 * bleu, 4)
+
+        # Report only per-task scores (no aggregated overall BLEU).
+        result = dict(scores_by_task)
+
+        prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+        result["gen_len"] = round(float(np.mean(prediction_lens)), 4)
+
+        if save_prefix is not None:
+            with open(os.path.join(training_args.output_dir, f"{save_prefix}_eval_predictions.jsonl"), "w") as fout:
+                for i, pred in enumerate(decoded_preds):
+                    fout.write(json.dumps({
+                        "task": tasks[i],
+                        "label": references_raw[i],
+                        "prediction": pred,
+                    }) + "\n")
+
+        return result
+
     print(f"-----Gradient checkpointing: {training_args.gradient_checkpointing} -----")
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
+        # Required in some PEFT + gradient checkpointing setups when the base model is frozen.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    # DEBUG: verify trainable params before training
+    if training_args.do_train:
+        trainable = []
+        all_count = 0
+        trainable_count = 0
+        for n, p in model.named_parameters():
+            all_count += p.numel()
+            if p.requires_grad:
+                trainable.append((n, tuple(p.shape)))
+                trainable_count += p.numel()
+        print("=== TRAINABLE PARAMS ===")
+        print("num trainable tensors:", len(trainable))
+        print("trainable params:", trainable_count)
+        print("all params:", all_count)
+        print("ratio:", trainable_count / all_count if all_count else 0.0)
+        for n, s in trainable[:50]:
+            print(n, s)
 
     trainer = UIETrainer(
         model=model,
@@ -511,7 +733,7 @@ def main():
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_rouge_metrics,
+        compute_metrics=compute_code_metrics if data_args.dataset_mode.lower() == "code" else compute_rouge_metrics,
         callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None
     )
 

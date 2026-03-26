@@ -1,11 +1,18 @@
 import torch
+import torch.nn as nn
+import numpy as np
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 from transformers import GenerationConfig
 from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.trainer import *
 from transformers.trainer_callback import TrainerCallback
+from transformers.trainer_utils import IntervalStrategy
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.trainer_pt_utils import nested_truncate
 
-from uie_collator import SUPPORTED_DECODER_MODELS, check_model
-from uie_dataset_lora import ANSWER_PREFIX
+from src.uie_collator import SUPPORTED_DECODER_MODELS, check_model
+from src.uie_dataset_lora import ANSWER_PREFIX
 
 
 def skip_instructions(model, predictions_ids, tokenizer, ignore_idx=-100):
@@ -52,75 +59,70 @@ class DenserEvalCallback(TrainerCallback):
 
 class UIETrainer(Seq2SeqTrainer):
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def compute_loss(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        return_outputs: bool = False,
+        num_items_in_batch: Optional[int] = None,
+    ):
+        """Compute loss with extra LoRA regularization terms.
+
+        We keep `training_step` from the parent class so backward/AMP/accelerate/deepspeed handling
+        stays compatible across Transformers versions.
         """
-        Perform a training step on a batch of inputs.
+        # Let the base class handle label smoothing etc by computing the base loss first.
+        # We need the raw outputs too if return_outputs is requested.
+        outputs = model(**inputs)
 
-        Subclass and override to inject custom behavior.
+        if self.label_smoother is not None and "labels" in inputs:
+            base_loss = self.label_smoother(outputs, inputs["labels"])
+        else:
+            base_loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
-        Args:
-            model (`nn.Module`):
-                The model to train.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
-
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
-
-        Return:
-            `torch.Tensor`: The tensor with training loss on this batch.
-        """
-        model.train()
-        inputs = self._prepare_inputs(inputs)
-
-        if is_sagemaker_mp_enabled():
-            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-            return loss_mb.reduce_mean().detach().to(self.args.device)
-
-        with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
-
-        if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
-        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
-            loss = loss / self.args.gradient_accumulation_steps
-
-        ########################### Regularization ##########################
-        orthogonal_loss = 0.
-        for name, param in self.model.named_parameters():
+        # Regularization
+        orthogonal_loss = 0.0
+        for name, param in model.named_parameters():
             if "lora_A" in name:
-                for name_, param_ in self.model.named_parameters():
-                    if "loranew_A" in name_ and name.split("lora_A")[0] == name_.split("loranew_A")[0]:
-                        orthogonal_loss += torch.abs(torch.mm(param, param_.T)).sum() # [r * dim] * [dim * r]
-                        break # target modules have been matched
+                for name2, param2 in model.named_parameters():
+                    if "loranew_A" in name2 and name.split("lora_A")[0] == name2.split("loranew_A")[0]:
+                        orthogonal_loss = orthogonal_loss + torch.abs(torch.mm(param, param2.T)).sum()
+                        break
 
-        # l2-normalization for loranew_A/B
-        l2_loss = 0.
-        for name, param in self.model.named_parameters():
+        l2_loss = 0.0
+        for name, param in model.named_parameters():
             if "loranew_" in name:
-                l2_loss += torch.norm(param, p=2)
+                l2_loss = l2_loss + torch.norm(param, p=2)
 
         lamda_1 = self.args.lamda_1
         lamda_2 = self.args.lamda_2
 
-        logger.info(f"orthogonal_loss: {orthogonal_loss.item()}; l2_loss: {l2_loss.item()}; accuracy_loss: {loss.item()}; λ1: {lamda_1}; λ2: {lamda_2}")
-        loss = loss + orthogonal_loss * lamda_1 + l2_loss * lamda_2
-        ######################################################################
+        total_loss = base_loss + orthogonal_loss * lamda_1 + l2_loss * lamda_2
 
-        if self.do_grad_scaling:
-            self.scaler.scale(loss).backward()
-        elif self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        elif self.deepspeed:
-            # loss gets scaled under gradient_accumulation_steps in deepspeed
-            loss = self.deepspeed.backward(loss)
-        else:
-            loss.backward()
+        # Optional logging (avoid `.item()` on floats)
+        def _as_float(x):
+            try:
+                return float(x.item())
+            except AttributeError:
+                return float(x)
 
-        return loss.detach()
+        logger.info(
+            f"orthogonal_loss: {_as_float(orthogonal_loss)}; "
+            f"l2_loss: {_as_float(l2_loss)}; "
+            f"accuracy_loss: {_as_float(base_loss)}; "
+            f"λ1: {lamda_1}; λ2: {lamda_2}"
+        )
+
+        return (total_loss, outputs) if return_outputs else total_loss
+
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        num_items_in_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        # Delegate backward/AMP/deepspeed/accelerate handling to the base Trainer.
+        return super().training_step(model, inputs, num_items_in_batch)
 
 
     def evaluation_loop(
@@ -301,27 +303,6 @@ class UIETrainer(Seq2SeqTrainer):
         prediction_loss_only: bool,
         ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Perform an evaluation step on `model` using `inputs`.
-
-        Subclass and override to inject custom behavior.
-
-        Args:
-            model (`nn.Module`):
-                The model to evaluate.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
-
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
-            prediction_loss_only (`bool`):
-                Whether or not to return the loss only.
-
-        Return:
-            Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
-            labels (each being optional).
-        """
-
         if not self.args.predict_with_generate or prediction_loss_only:
             return super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
@@ -332,7 +313,7 @@ class UIETrainer(Seq2SeqTrainer):
 
         # XXX: adapt synced_gpus for fairscale as well
         gen_kwargs = self._gen_kwargs
-        gen_kwargs["synced_gpus"] = True if is_deepspeed_zero3_enabled() else False
+        synced_gpus = True if is_deepspeed_zero3_enabled() else False
 
         if "attention_mask" in inputs:
             gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
@@ -348,8 +329,9 @@ class UIETrainer(Seq2SeqTrainer):
             generation_inputs = inputs[self.model.main_input_name]
 
         generated_tokens = self.model.generate(
-            input_ids=generation_inputs, 
-            generation_config=generation_config
+            input_ids=generation_inputs,
+            generation_config=generation_config,
+            synced_gpus=synced_gpus,
         )
 
         bs, source_len = inputs['input_ids'].shape
