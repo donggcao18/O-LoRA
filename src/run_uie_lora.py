@@ -57,7 +57,11 @@ from transformers import (
     set_seed, )
 from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint
-from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig  # add
+try:
+    from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig  # add
+except ModuleNotFoundError:
+    # Fallback to vendored PEFT inside this repository when pip `peft` is not installed.
+    from src.peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
 
 from src.uie_collator import DataCollatorForUIE
 from src.uie_dataset_lora import gen_cache_path
