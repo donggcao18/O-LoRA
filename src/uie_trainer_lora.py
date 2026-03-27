@@ -8,7 +8,17 @@ from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.trainer import *
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import IntervalStrategy
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+# Compatibility across Transformers versions:
+# - newer versions: transformers.integrations.deepspeed
+# - older versions: transformers.deepspeed
+try:
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+except Exception:
+    try:
+        from transformers.deepspeed import is_deepspeed_zero3_enabled
+    except Exception:
+        def is_deepspeed_zero3_enabled() -> bool:
+            return False
 from transformers.trainer_pt_utils import nested_truncate
 
 from src.uie_collator import SUPPORTED_DECODER_MODELS, check_model
