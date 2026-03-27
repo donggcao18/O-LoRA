@@ -12,3 +12,4 @@ sentencepiece==0.1.96
 protobuf==3.20.3
 ninja==1.11.1
 accelerate==0.20.3
+numpy==1.22.2
