@@ -6,6 +6,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 python src/run_uie_lora.py  \
     --model_name_or_path Salesforce/codet5p-770m  \
+    --cache_dir ./.cache  \
     --dataset_mode code  \
     --code_task CodeTrans  \
     --output_dir logs_and_outputs/code_t5_extended_task \
