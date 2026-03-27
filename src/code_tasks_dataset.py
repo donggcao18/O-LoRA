@@ -23,6 +23,11 @@ import datasets
 import numpy as np
 from datasets import Dataset, DatasetDict, load_dataset
 
+try:
+    from huggingface_hub import snapshot_download
+except Exception:  # pragma: no cover - optional dependency in some environments
+    snapshot_download = None
+
 from src.task_info import INSTRUCTION_POOL, INSTRUCTION_SPLIT_POLICY, TASK_SPECS as TASK_SPECS_META
 
 
@@ -125,6 +130,34 @@ TASK_SPECS: Dict[str, CodeTaskSpec] = {
         dataset_kwargs=None,
     ),
 }
+
+
+def _load_dataset_compat(dataset_name: str, *, cache_dir: Optional[str] = None, **kwargs):
+    """Load a HF dataset with a fallback for fsspec glob-pattern incompatibility.
+
+    Some datasets/fsspec version combinations fail with:
+    "Invalid pattern: '**' can only be an entire path component".
+    If that happens, we snapshot the dataset repo locally and load from disk.
+    """
+    try:
+        return load_dataset(dataset_name, cache_dir=cache_dir, **kwargs)
+    except ValueError as e:
+        msg = str(e)
+        if "Invalid pattern" not in msg or "**" not in msg:
+            raise
+        if snapshot_download is None:
+            raise RuntimeError(
+                "Dataset loading failed due to an fsspec glob-pattern incompatibility, and "
+                "huggingface_hub.snapshot_download is unavailable for fallback. "
+                "Install/upgrade huggingface_hub or use compatible datasets/fsspec versions."
+            ) from e
+
+        local_repo = snapshot_download(
+            repo_id=dataset_name,
+            repo_type="dataset",
+            cache_dir=cache_dir,
+        )
+        return load_dataset(local_repo, cache_dir=cache_dir, **kwargs)
 
 
 def _to_string(value) -> str:
@@ -236,11 +269,26 @@ def build_code_task_dataset(
     def load_split(split_name: str) -> Dataset:
         if task == "TheVault_Csharp":
             if split_name == "train":
-                return load_dataset(spec.dataset_name, cache_dir=cache_dir, split_set="train/small", **dataset_kwargs)
-            return load_dataset(spec.dataset_name, cache_dir=cache_dir, split_set=split_name, **dataset_kwargs)
+                return _load_dataset_compat(
+                    spec.dataset_name,
+                    cache_dir=cache_dir,
+                    split_set="train/small",
+                    **dataset_kwargs,
+                )
+            return _load_dataset_compat(
+                spec.dataset_name,
+                cache_dir=cache_dir,
+                split_set=split_name,
+                **dataset_kwargs,
+            )
 
         # Most datasets accept split=...
-        return load_dataset(spec.dataset_name, cache_dir=cache_dir, split=split_name, **dataset_kwargs)
+        return _load_dataset_compat(
+            spec.dataset_name,
+            cache_dir=cache_dir,
+            split=split_name,
+            **dataset_kwargs,
+        )
 
     # Load raw splits
     if spec.is_train_only:
