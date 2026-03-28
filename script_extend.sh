@@ -26,9 +26,9 @@ python src/run_uie_lora.py  \
     --logging_strategy steps \
     --logging_steps 25  \
     --evaluation_strategy steps \
-    --eval_steps 200  \
+    --eval_steps 50  \
     --save_strategy steps \
-    --save_steps 200  \
+    --save_steps 50  \
     --save_total_limit 2  \
     --fp16 \
     --report_to none

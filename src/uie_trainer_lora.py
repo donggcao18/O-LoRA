@@ -335,11 +335,23 @@ class UIETrainer(Seq2SeqTrainer):
         )
 
         bs, source_len = inputs['input_ids'].shape
+        max_new_tokens = gen_kwargs.get("max_new_tokens", None)
+        max_length_from_config = gen_kwargs.get("max_length", None)
         # in case the batch is shorter than max length, the output should be padded
         if check_model(self.model.config._name_or_path, SUPPORTED_DECODER_MODELS):
-            max_length = source_len + gen_kwargs["max_new_tokens"]
+            if max_new_tokens is not None:
+                max_length = source_len + max_new_tokens
+            elif max_length_from_config is not None:
+                max_length = max_length_from_config
+            else:
+                max_length = generated_tokens.shape[-1]
         else:
-            max_length = gen_kwargs["max_new_tokens"]
+            if max_new_tokens is not None:
+                max_length = max_new_tokens
+            elif max_length_from_config is not None:
+                max_length = max_length_from_config
+            else:
+                max_length = generated_tokens.shape[-1]
 
         if generated_tokens.shape[-1] < max_length:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, max_length)
@@ -360,8 +372,9 @@ class UIETrainer(Seq2SeqTrainer):
 
         if has_labels:
             labels = inputs["labels"]
-            if labels.shape[-1] < gen_kwargs["max_new_tokens"]:
-                labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_new_tokens"])
+            labels_target_len = max_new_tokens if max_new_tokens is not None else max_length_from_config
+            if labels_target_len is not None and labels.shape[-1] < labels_target_len:
+                labels = self._pad_tensors_to_max_len(labels, labels_target_len)
         else:
             labels = None
 
