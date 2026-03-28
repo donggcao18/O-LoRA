@@ -59,6 +59,19 @@ class DenserEvalCallback(TrainerCallback):
 
 class UIETrainer(Seq2SeqTrainer):
 
+    def _pad_across_processes_compat(self, tensor: Union[torch.Tensor, Any], pad_index: int = -100):
+        """Pad tensors across processes for multiple Transformers versions."""
+        try:
+            return super()._pad_across_processes(tensor)
+        except AttributeError:
+            pass
+
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is not None and hasattr(accelerator, "pad_across_processes"):
+            return accelerator.pad_across_processes(tensor, dim=1, pad_index=pad_index)
+
+        return tensor
+
     def compute_loss(
         self,
         model: nn.Module,
@@ -212,11 +225,11 @@ class UIETrainer(Seq2SeqTrainer):
                 losses = self._nested_gather(loss.repeat(batch_size))
                 losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
             if labels is not None:
-                labels = self._pad_across_processes(labels)
+                labels = self._pad_across_processes_compat(labels)
                 labels = self._nested_gather(labels)
                 labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
             if logits is not None:
-                logits = self._pad_across_processes(logits)
+                logits = self._pad_across_processes_compat(logits)
                 logits = self._nested_gather(logits)
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
