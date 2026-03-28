@@ -596,7 +596,7 @@ def main():
         import re
         import string
 
-        from smooth_bleu_utils import compute_smooth_bleu
+        from src.smooth_bleu_utils import compute_smooth_bleu
 
         def normalize_text(s: str) -> str:
             # Match the user's BLEU normalization
