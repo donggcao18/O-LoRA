@@ -539,13 +539,20 @@ def main():
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
 
     if data_args.dataset_mode.lower() == "code":
-        data_collator = DataCollatorForSeq2Seq(
+        base_code_collator = DataCollatorForSeq2Seq(
             tokenizer=tokenizer,
             model=model,
             padding="longest",
             label_pad_token_id=label_pad_token_id,
             pad_to_multiple_of=8 if training_args.fp16 else None,
         )
+
+        # Keep metadata columns on the dataset for metric computation, but drop them from model batches.
+        code_meta_keys = {"task", "Task", "Dataset", "Instance", "instance", "labels_text", "Samples", "subset"}
+
+        def data_collator(features):
+            filtered = [{k: v for k, v in f.items() if k not in code_meta_keys} for f in features]
+            return base_code_collator(filtered)
     else:
         data_collator = DataCollatorForUIE(
             tokenizer,
