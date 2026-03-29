@@ -308,6 +308,9 @@ def build_code_task_dataset(
         labels = [(lid if lid != pad_token_id else -100) for lid in labels]
 
         model_inputs["labels"] = labels
+        # Keep lightweight metadata for evaluation/reporting.
+        model_inputs["task"] = task
+        model_inputs["labels_text"] = raw_label
         return model_inputs
 
     train_ds = train_ds.map(lambda e: preprocess(e, split_name="train"), remove_columns=train_ds.column_names)

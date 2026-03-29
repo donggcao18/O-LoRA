@@ -653,14 +653,41 @@ def main():
 
         decoded_preds = skip_instructions(model, preds, tokenizer)
 
-        # For code dataset adapter we store raw label as a plain string in column `labels_text` if present;
-        # fallback to `Instance/label` when evaluating on UIE-style datasets.
-        if "labels_text" in dataset.column_names:
+        # Extract references across multiple dataset schemas used in this repo.
+        # Priority:
+        # 1) explicit plain-text references (`labels_text`),
+        # 2) UIE-style nested labels (`Instance/label` or `instance/label`),
+        # 3) decode tokenized labels from `labels`.
+        column_names = set(dataset.column_names)
+        if "labels_text" in column_names:
             references_raw = list(dataset["labels_text"])
-            tasks = list(dataset["task"]) if "task" in dataset.column_names else ["unknown"] * len(references_raw)
+        elif "Instance" in column_names or "instance" in column_names:
+            instance_key = "Instance" if "Instance" in column_names else "instance"
+            references_raw = [((e.get(instance_key) or {}).get("label") or "") for e in dataset]
+        elif "labels" in column_names:
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+            labels_for_decode = [
+                [(tok if tok != -100 else pad_id) for tok in row]
+                for row in dataset["labels"]
+            ]
+            references_raw = tokenizer.batch_decode(labels_for_decode, skip_special_tokens=True)
         else:
-            references_raw = [e["Instance"]["label"] for e in dataset]
-            tasks = list(dataset["Task"]) if "Task" in dataset.column_names else ["unknown"] * len(references_raw)
+            raise KeyError(
+                "Unable to find references for code metrics. Expected one of: "
+                "labels_text, Instance.label, instance.label, or labels. "
+                f"Available columns: {sorted(column_names)}"
+            )
+
+        if "task" in column_names:
+            tasks = list(dataset["task"])
+        elif "Task" in column_names:
+            tasks = list(dataset["Task"])
+        elif getattr(data_args, "code_task", None):
+            tasks = [data_args.code_task] * len(references_raw)
+        else:
+            tasks = ["unknown"] * len(references_raw)
+
+        references_raw = ["" if r is None else str(r) for r in references_raw]
 
         # Corpus BLEU style expects list of refs per example
         refs_norm = [[normalize_text(r)] for r in references_raw]
