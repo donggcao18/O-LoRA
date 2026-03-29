@@ -101,7 +101,7 @@ TASK_SPECS: Dict[str, CodeTaskSpec] = {
         dataset_name="Fsoft-AIC/the-vault-function",
         text_key="code",
         label_key="docstring",
-        dataset_kwargs={"languages": ["c_sharp"]},
+        dataset_kwargs={"languages": ["c#"]},
     ),
     "KodCode": CodeTaskSpec(
         dataset_name="KodCode/KodCode-V1-SFT-R1",
@@ -236,7 +236,7 @@ def build_code_task_dataset(
     def load_split(split_name: str) -> Dataset:
         if task == "TheVault_Csharp":
             if split_name == "train":
-                return load_dataset(spec.dataset_name, cache_dir=cache_dir, split_set="train/small", **dataset_kwargs)
+                return load_dataset(spec.dataset_name, cache_dir=cache_dir, split_set=["train/small"], **dataset_kwargs)
             return load_dataset(spec.dataset_name, cache_dir=cache_dir, split_set=split_name, **dataset_kwargs)
 
         # Most datasets accept split=...
